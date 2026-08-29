@@ -2,6 +2,8 @@
 
 一个给 AI coding agent（Claude Code 等）用的 [Herdr](https://herdr.dev) 技能：agent 需要跑长时进程（服务端、LLM 代理、训练、测评……）时，不再 `nohup` 到你看不见的地方，而是把它放进 Herdr 里一个专门的 `background` 工作区——**进程就在终端 pane 里以前台方式跑着**，你随时切过去看输出、Ctrl-C 停掉，日志同时完整落盘。
 
+![background 工作区：按用途分 tab，每个 pane 一个前台进程](imgs/0.png)
+
 ## 它解决什么问题
 
 让 agent 起个后台服务，通常的结局是：
@@ -48,10 +50,10 @@ background 工作区
 ├── llm_proxy_1            ← 用途 llm_proxy 的第 1 个 tab
 │   ┌────────────────┬────────────────┐
 │   │ vllm api       │ vllm api       │   ← 每个 pane 一个前台进程
-│   │ proxy:7890     │ proxy:7891     │      名字 = 备注:端口
+│   │ proxy:28117    │ proxy:28118    │      名字 = 备注:端口
 │   ├────────────────┼────────────────┤
 │   │ vllm api       │  (空闲槽位)    │
-│   │ proxy:7892     │                │
+│   │ proxy:28119    │                │
 │   └────────────────┴────────────────┘
 └── rollout_1
 ```
@@ -67,7 +69,7 @@ background 工作区
 
 不用记命令，正常说话即可，比如：
 
-> 帮我起一个 vLLM 的代理服务，监听 7890，确认能访问了告诉我地址
+> 帮我起一个 vLLM 的代理服务，监听 28117，确认能访问了告诉我地址
 > 把训练任务放到后台跑，我要随时能看进度
 > 这 5 个 watcher 都在跑吗？
 
@@ -90,7 +92,7 @@ tab 和日志目录都按**用途**（`llm_proxy`、`rollout`、`sft` 这样的�
 S=~/.claude/skills/herdr-run/scripts/herdr_run.py
 
 python3 $S launch <用途> "<完整命令>" [--note 备注] [--port 端口]   # 启动
-python3 $S list                                 # 在跑的进程一览
+python3 $S list                                 # 进程一览（每 pane 附最近 8 行屏幕输出）
 python3 $S list --purposes                      # 已登记的用途一览
 python3 $S list --history                       # 含已退出的全部记录
 ```
@@ -102,16 +104,16 @@ python3 $S list --history                       # 含已退出的全部记录
 ## FAQ
 
 **进程退出后 pane 会怎样？**
-pane 保留，显示最后的输出，状态变 idle；同一 tab 系列再启新进程时，空闲的根 pane 会被复用，不会无限增殖。
+pane 保留，显示最后的输出，状态变 idle。新启动的进程**永远开新 pane**，不复用旧 pane（哪怕它空闲）——pane 归属于它的启动，直到你把它关掉；关 pane 就是释放槽位的方式。tab 满 4 格后，第 5 个同类进程自动开下一个 tab。
 
 **日志文件名里的备注是哪来的？**
 agent 启动时给的简短备注（`--note`），同时也是 pane 标题。比如 `260829-221549-vllm-api-proxy.log`。
 
-**为什么 pane 名字里有 `:7890` 这样的端口？**
+**为什么 pane 名字里有 `:28117` 这样的端口？**
 凡是监听端口的进程，端口都会标进 pane 名，端口冲突一眼可见。多个端口逗号分隔。
 
 **全局启动记录放在哪？**
 默认 `~/.claude/skills/herdr-run/data/launches.jsonl`（项目级安装则随项目，在 `<项目>/.claude/skills/herdr-run/data/`）。想换位置：环境变量 `HERDR_RUN_RECORD_FILE` 或启动时加 `--record-file`；某次不想记录就 `--no-record`。
 
 **支持 Windows 吗？**
-支持。Windows 上 pane 是 PowerShell，脚本会用明确的 UTF-8 writer 同时输出到 pane 和日志，并用运行标记避免嵌套 PowerShell 被误判为空闲。包含多行或嵌套引号的命令建议写入 `.ps1`，再用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1` 启动；走 WSL 也完全可用。
+支持。Windows 上 pane 是 PowerShell，脚本会用明确的 UTF-8 writer 同时输出到 pane 和日志。包含多行或嵌套引号的命令建议写入 `.ps1`，再用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1` 启动；走 WSL 也完全可用。
