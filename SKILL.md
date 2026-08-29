@@ -1,6 +1,6 @@
 ---
 name: herdr-run
-description: Launch long-running background processes (web servers, LLM proxies, training jobs, eval runs, daemons, watchers) as live, user-controllable foreground processes inside a dedicated Herdr "background" workspace. Creates the workspace and {purpose}_N tabs automatically, places each process in a pane (max 4 per tab in a 2x2 grid, then a new tab), names panes with their listening ports, tees all output to logs/{purpose}/, and records every launch in a global registry. Use whenever the user asks to start, run, launch, or deploy any server, service, training, or eval process that should keep running where they can watch and control it (启动服务, 后台跑训练, 部署代理). Not for one-shot commands — use plain Bash for those.
+description: Launch long-running background processes (web servers, LLM proxies, training jobs, eval runs, daemons, watchers) as live, user-controllable foreground processes inside a dedicated Herdr "background" workspace. Creates the workspace and {purpose}_N tabs automatically, places each process in a pane (max 4 per tab in a 2x2 grid, then a new tab), names panes with their listening ports, tees all output to logs/{purpose}/, and records every launch in a per-project registry (logs/launches.jsonl). Use whenever the user asks to start, run, launch, or deploy any server, service, training, or eval process that should keep running where they can watch and control it (启动服务, 后台跑训练, 部署代理). Not for one-shot commands — use plain Bash for those.
 ---
 
 # herdr-run
@@ -39,7 +39,7 @@ Purpose names (the `llm_proxy` in `llm_proxy_1`) are the vocabulary the user see
 3. For a genuinely new kind of process, **ask the user to name it** (or propose a name and get their nod — if they already named it in their request, that counts). Then launch with `--new-purpose`.
 4. The script rejects unknown purposes without `--new-purpose`, listing what is registered — treat that error as "go ask", never as "find a way around".
 
-The registry has no file of its own: known purposes are derived from the launch registry (`<skill>/data/launches.jsonl`, override with `HERDR_RUN_RECORD_FILE` / `--record-file`) plus every live `{purpose}_n` tab. Editing that JSONL edits the vocabulary.
+The registry has no file of its own: known purposes are derived from the project's launch registry (`<cwd>/logs/launches.jsonl`, override with `HERDR_RUN_RECORD_FILE` / `--record-file`) plus every live `{purpose}_n` tab. Editing that JSONL edits the vocabulary.
 
 ## What you must decide before launching
 
@@ -66,7 +66,7 @@ lsof -nP -iTCP:<port> -sTCP:LISTEN                           # macOS / Linux
 Get-NetTCPConnection -LocalPort <port> -State Listen         # Windows PowerShell
 ```
 
-Note: on herdr 0.8.2 `pane read --lines N` returns empty output — do not pass `--lines`. Output longer than the pane's screen is in the log file anyway.
+Note: on herdr 0.8.2 `pane read --lines N` returns truncated/broken output — do not pass `--lines`. Output longer than the pane's screen is in the log file anyway.
 
 Everything the process prints is also on disk at the reported `log` path — prefer reading the file for long output. To stop a process, send it a Ctrl-C (it is a foreground process in that pane):
 
@@ -83,7 +83,7 @@ python3 <skill-dir>/scripts/herdr_run.py list --purposes   # registered purposes
 python3 <skill-dir>/scripts/herdr_run.py list --json       # machine-readable
 ```
 
-Each row joins a registry entry with live herdr state: `live` (pane still exists), `superseded` (older entry on the same pane — legacy data; panes are no longer reused), `gone` (pane closed). Liveness is not computed — below the table each process shows its last few screen lines (default 8, `--lines N` to adjust, `0` to hide), and a shell prompt in that segment means the process exited while scrolling output means it is busy; read it directly. Rows whose pane is gone fall back to a tail of their log file. It also flags untracked panes that live in the background workspace but were not launched through this skill.
+Each row joins a registry entry with live herdr state: `live` (pane still exists), `superseded` (older entry on the same pane — legacy data; panes are no longer reused), `gone` (pane closed). Liveness is not computed — below the table each process shows its last few screen lines (default 8, `--lines N` to adjust, `0` to hide), and a shell prompt in that segment means the process exited while scrolling output means it is busy; read it directly. Rows whose pane is gone fall back to a tail of their log file. It also flags untracked panes that live in the background workspace but were not launched through this skill. The registry is read from beside the logs of the current directory; when you launched with a different `--cwd`/`--log-dir`, pass `--log-dir` to `list` too.
 
 ## Placement rules (what the user sees)
 
@@ -98,15 +98,15 @@ Each row joins a registry entry with live herdr state: `live` (pane still exists
 | `--note TEXT` | first words of command | pane title; also the log filename slug |
 | `--port N` (repeatable) | none | listening port(s), shown in pane title |
 | `--cwd PATH` | current dir | working directory of the process |
-| `--log-dir PATH` | `<cwd>/logs` | log root; file lands in `<log-dir>/<purpose>/<yymmdd-hhmmss-note>.log` (`-2` suffix on same-second collisions) |
+| `--log-dir PATH` | `<cwd>/logs` | log root; files land in `<log-dir>/<purpose>/<yymmdd-hhmmss-note>.log` (`-2` suffix on same-second collisions). The launch registry lives there too, as `launches.jsonl` |
 | `--new-purpose` | off | register a genuinely new purpose — only after asking the user |
 | `--workspace-label` | `background` (env `HERDR_RUN_WORKSPACE`) | target workspace |
-| `--record-file PATH` | `<skill>/data/launches.jsonl` (env `HERDR_RUN_RECORD_FILE`) | global registry |
+| `--record-file PATH` | `<log-dir>/launches.jsonl` (env `HERDR_RUN_RECORD_FILE`) | launch registry — project-level runtime data, never stored inside the skill |
 | `--no-record` | off | skip the registry entry (the purpose then only stays known via its live tabs) |
 | `--focus` | off | focus the new tab |
 | `--dry-run` | off | print the placement plan, change nothing |
 
-`list` options: `--purposes` (purpose registry instead of processes), `--history` (include exited/superseded), `--lines N` (screen lines shown per process, default 8, `0` hides), `--json`, plus the same `--workspace-label` / `--record-file`.
+`list` options: `--purposes` (purpose registry instead of processes), `--history` (include exited/superseded), `--lines N` (screen lines shown per process, default 8, `0` hides), `--log-dir PATH` (registry location, when launched from elsewhere), `--json`, plus the same `--workspace-label` / `--record-file`.
 
 ## Edge cases
 
@@ -116,4 +116,5 @@ Each row joins a registry entry with live herdr state: `live` (pane still exists
 - **Interactive prompts** (confirmation, login) will block the pane; read the pane and answer via `herdr pane send-text <pane_id> "<answer>"` or pick non-interactive flags upfront.
 - **Processes that daemonize themselves** (`&`, `nohup`, daemon mode) defeat the design — the pane would go idle while the real process hides. Strip backgrounding and let the pane be the process's lifetime.
 - The script refuses nothing silently: any herdr error is reported with the failing command. `--dry-run` is cheap — use it when unsure about placement.
+- **Pane shells**: the generated launch line assumes a POSIX shell (`{ ...; }` groups, `$(date)`, `tee`) on macOS/Linux panes; a fish pane will not run it and the launch fails loudly with a banner timeout.
 - **Platforms**: macOS, Linux, and Windows all work. The logging pipeline is generated per platform; Windows PowerShell uses an explicit UTF-8 writer.

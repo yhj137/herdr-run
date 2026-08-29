@@ -65,7 +65,7 @@ background 工作区
 - **看**：切到 `background` 工作区，输出就在屏幕上滚动
 - **停**：选中那个 pane 按 Ctrl-C，跟你在自己终端里一样
 - **找日志**：每个进程的完整输出都 tee 在 `<项目>/logs/<用途>/<日期时间>-<备注>.log`
-- **查历史**：启动记录 `data/launches.jsonl`（全局安装即 `~/.claude/skills/herdr-run/data/launches.jsonl`）记着每一次启动（时间、完整命令、端口、pane、日志路径），跨项目可查
+- **查历史**：启动记录 `logs/launches.jsonl`（项目级，与日志同目录）记着每一次启动（时间、完整命令、端口、pane、日志路径）。建议把 `logs/` 加进项目 `.gitignore`——进程输出和启动记录都落在这里，可能含敏感信息
 
 ## 怎么用
 
@@ -83,7 +83,7 @@ tab 和日志目录都按**用途**（`llm_proxy`、`rollout`、`sft` 这样的�
 
 - 已登记的用途，agent 直接复用——同一个用途的第 2、3、4 个进程进同一个 tab 系列
 - **全新**的用途，agent 会先向你确认名字再登记（你说的话里已经起了名就算确认过）
-- 注册表**没有独立的文件**：已知用途 = 启动记录文件 ∪ 现存的 `{用途}_n` tab。启动记录默认在 `~/.claude/skills/herdr-run/data/launches.jsonl`（项目级安装则在 `<项目>/.claude/skills/herdr-run/data/`），每行一次启动。想清理或修正用途词汇表，直接编辑这份 JSONL 即可，删掉的用途下次启动就会被当作新用途重新询问
+- 注册表**没有独立的文件**：已知用途 = 启动记录文件 ∪ 现存的 `{用途}_n` tab。启动记录默认在项目的 `logs/launches.jsonl`（与日志同目录——skill 本身不存储任何数据，运行时数据全部留在项目里；`HERDR_RUN_RECORD_FILE` / `--record-file` 可改位置），每行一次启动。想清理或修正用途词汇表，直接编辑这份 JSONL 即可，删掉的用途下次启动就会被当作新用途重新询问
 - 已登记的用途一览：`python3 ~/.claude/skills/herdr-run/scripts/herdr_run.py list --purposes`；在跑的进程一览：同命令不带参数
 
 ## 命令参考
@@ -99,7 +99,7 @@ python3 $S list --purposes                      # 已登记的用途一览
 python3 $S list --history                       # 含已退出的全部记录
 ```
 
-启动选项：`--cwd` 工作目录（默认当前目录）、`--log-dir` 日志根目录（默认 `<cwd>/logs`）、`--new-purpose` 登记新用途、`--no-record` 不写全局记录、`--focus` 启动后聚焦新 tab、`--dry-run` 只打印放置计划。
+启动选项：`--cwd` 工作目录（默认当前目录）、`--log-dir` 日志根目录（默认 `<cwd>/logs`）、`--new-purpose` 登记新用途、`--no-record` 不写启动记录、`--focus` 启动后聚焦新 tab、`--dry-run` 只打印放置计划；完整选项见 SKILL.md。
 
 对进程的后续操作走 herdr 本身：`herdr pane read <pane_id> --source recent-unwrapped` 看输出、`herdr pane send-keys <pane_id> ctrl+c` 停止。
 
@@ -114,8 +114,8 @@ agent 启动时给的简短备注（`--note`），同时也是 pane 标题。比
 **为什么 pane 名字里有 `:28117` 这样的端口？**
 凡是监听端口的进程，端口都会标进 pane 名，端口冲突一眼可见。多个端口逗号分隔。
 
-**全局启动记录放在哪？**
-默认 `~/.claude/skills/herdr-run/data/launches.jsonl`（项目级安装则随项目，在 `<项目>/.claude/skills/herdr-run/data/`）。想换位置：环境变量 `HERDR_RUN_RECORD_FILE` 或启动时加 `--record-file`；某次不想记录就 `--no-record`。
+**启动记录放在哪？**
+项目的 `logs/launches.jsonl`，与日志同目录——skill 本身不存储任何数据，运行时数据全部留在你的项目里。想换位置：环境变量 `HERDR_RUN_RECORD_FILE` 或启动时加 `--record-file`；某次不想记录就 `--no-record`。记得把 `logs/` 加进项目 `.gitignore`。
 
 **支持 Windows 吗？**
 支持。Windows 上 pane 是 PowerShell，脚本会用明确的 UTF-8 writer 同时输出到 pane 和日志。包含多行或嵌套引号的命令建议写入 `.ps1`，再用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1` 启动；走 WSL 也完全可用。

@@ -65,7 +65,7 @@ You can:
 - **Watch** — switch to the `background` workspace; output is scrolling right there
 - **Stop** — select the pane and press Ctrl-C, exactly like in your own terminal
 - **Find logs** — every process's full output is tee'd to `<project>/logs/<purpose>/<datetime>-<note>.log`
-- **Check history** — the launch registry `data/launches.jsonl` (for a global install, `~/.claude/skills/herdr-run/data/launches.jsonl`) records every launch (time, full command, ports, pane, log path), searchable across projects
+- **Check history** — the launch registry `logs/launches.jsonl` (project-level, beside the logs) records every launch (time, full command, ports, pane, log path). Consider adding `logs/` to your project's `.gitignore` — process output and launch records live there and may contain secrets
 
 ## How to use it
 
@@ -83,7 +83,7 @@ Tabs and log directories are organized by **purpose** (short slugs like `llm_pro
 
 - Registered purposes are reused as-is — the 2nd, 3rd, 4th process of a kind go into the same tab series
 - For a **genuinely new** purpose the agent asks you to name it first (if you already named it in your request, that counts as consent)
-- The registry has **no file of its own**: known purposes = the launch record file ∪ live `{purpose}_n` tabs. The record file defaults to `~/.claude/skills/herdr-run/data/launches.jsonl` (project-level installs keep it in `<project>/.claude/skills/herdr-run/data/`), one line per launch. To prune or fix the vocabulary, edit that JSONL directly — a deleted purpose simply gets asked about again next time
+- The registry has **no file of its own**: known purposes = the launch record file ∪ live `{purpose}_n` tabs. The record file defaults to the project's `logs/launches.jsonl` (beside the logs — the skill itself stores no data anywhere; relocate via `HERDR_RUN_RECORD_FILE` / `--record-file`), one line per launch. To prune or fix the vocabulary, edit that JSONL directly — a deleted purpose simply gets asked about again next time
 - See registered purposes: `python3 ~/.claude/skills/herdr-run/scripts/herdr_run.py list --purposes`; see running processes: the same command with no arguments
 
 ## Command reference
@@ -99,7 +99,7 @@ python3 $S list --purposes                      # registered purposes
 python3 $S list --history                       # everything ever launched
 ```
 
-Launch options: `--cwd` working directory (default: current), `--log-dir` log root (default `<cwd>/logs`), `--new-purpose` register a new purpose, `--no-record` skip the global registry, `--focus` focus the new tab, `--dry-run` print the placement plan only.
+Launch options: `--cwd` working directory (default: current), `--log-dir` log root (default `<cwd>/logs`), `--new-purpose` register a new purpose, `--no-record` skip the launch registry, `--focus` focus the new tab, `--dry-run` print the placement plan only; see SKILL.md for the full list.
 
 Follow-up control goes through herdr itself: `herdr pane read <pane_id> --source recent-unwrapped` to read output, `herdr pane send-keys <pane_id> ctrl+c` to stop.
 
@@ -114,8 +114,8 @@ The short note the agent chose at launch (`--note`), which doubles as the pane t
 **Why do pane names contain ports like `:28117`?**
 Any process that listens on a port carries that port in its pane name, so port conflicts are visible at a glance. Multiple ports are comma-separated.
 
-**Where is the global launch registry?**
-Defaults to `~/.claude/skills/herdr-run/data/launches.jsonl` (project-level installs keep it with the project, under `<project>/.claude/skills/herdr-run/data/`). To relocate it: the `HERDR_RUN_RECORD_FILE` env var or `--record-file`; to skip recording for one launch: `--no-record`.
+**Where is the launch registry?**
+In the project's `logs/launches.jsonl`, beside the logs — the skill itself stores no data; all runtime data stays in your project. To relocate it: the `HERDR_RUN_RECORD_FILE` env var or `--record-file`; to skip recording for one launch: `--no-record`. Remember to add `logs/` to your project's `.gitignore`.
 
 **Does it work on Windows?**
 Yes. Panes on Windows are PowerShell; the script uses an explicit UTF-8 writer that echoes every line live and writes the same bytes to the log. Commands with multiple lines or nested quotes are best written to a `.ps1` and launched with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1`; WSL works fine too.

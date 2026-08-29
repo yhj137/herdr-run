@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """herdr-run: launch persistent foreground processes into a dedicated herdr
 "background" workspace, with automatic tab/pane placement, tee logging, and
-a global launch registry.
+a per-project launch registry.
 
 Usage:
     python3 herdr_run.py launch <purpose> "<command>" [options]
@@ -36,13 +36,7 @@ import sys
 from datetime import datetime
 from uuid import uuid4
 
-SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_WORKSPACE_LABEL = os.environ.get("HERDR_RUN_WORKSPACE", "background")
-# The global launch registry lives in the skill's own data directory so it
-# travels with the skill; HERDR_RUN_RECORD_FILE / --record-file override it.
-DEFAULT_RECORD_FILE = os.environ.get(
-    "HERDR_RUN_RECORD_FILE", os.path.join(SKILL_DIR, "data", "launches.jsonl")
-)
+DEFAULT_WORKSPACE_LABEL = os.environ.get("HERDR_RUN_WORKSPACE") or "background"
 ON_WINDOWS = sys.platform == "win32"
 MAX_PANES_PER_TAB = 4
 
@@ -88,16 +82,13 @@ def herdr(*args):
         die(f"`herdr {' '.join(args)}` returned non-JSON output: {out[:200]}")
 
 
-def herdr_try(*args):
-    """Like herdr(), but returns None instead of exiting on failure
-    (e.g. querying a pane that has since closed)."""
-    proc = run_herdr_process(args)
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
+def resolve_record_file(cli_value, log_dir):
+    """The launch registry is project-level runtime data: it lives beside
+    the logs (default <cwd>/logs/launches.jsonl), never inside the skill.
+    HERDR_RUN_RECORD_FILE / --record-file still override."""
+    env_value = os.environ.get("HERDR_RUN_RECORD_FILE")
+    base = cli_value or env_value or os.path.join(log_dir, "launches.jsonl")
+    return os.path.abspath(base)
 
 
 def sanitize_purpose(raw):
@@ -174,7 +165,7 @@ def read_registry(record_file):
     """All launch-registry entries, oldest first."""
     entries = []
     try:
-        with open(record_file, encoding="utf-8") as fh:
+        with open(record_file, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -183,7 +174,7 @@ def read_registry(record_file):
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     warn(f"skipping malformed registry line: {line[:80]}")
-    except FileNotFoundError:
+    except OSError:
         pass
     return entries
 
@@ -244,13 +235,17 @@ def pane_layout_rects(any_pane_id):
             if "rect" in p}
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]"             # CSI sequences
+    r"|\x1b\][^\x07\x1b]*(\x07|\x1b\\)")  # OSC sequences (window titles)
 
 
 def recent_lines(text, n=8, width=120):
     """The last n non-empty lines of a pane screen or log tail - ANSI
     stripped and width-capped.  Empty lines are skipped so trailing blanks
     never hide the output that matters."""
+    if n <= 0:
+        return []
     lines = [ANSI_RE.sub("", ln).rstrip() for ln in (text or "").splitlines()]
     lines = [ln for ln in lines if ln.strip()]
     return [ln[:width - 1] + "…" if len(ln) > width else ln
@@ -261,6 +256,8 @@ def pane_recent(pane_id, n=8):
     """Recent screen segment of a live pane.  A shell prompt in it means
     the process exited; scrolling output means it is busy.  Liveness is
     read off the screen by the agent, not computed."""
+    if n <= 0:
+        return []
     proc = run_herdr_process(
         ["pane", "read", pane_id, "--source", "recent-unwrapped"])
     if proc.returncode != 0:
@@ -270,6 +267,8 @@ def pane_recent(pane_id, n=8):
 
 def log_recent(log_path, n=8):
     """Tail segment of the on-disk log, for rows whose pane is gone."""
+    if n <= 0:
+        return []
     try:
         with open(log_path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -334,7 +333,7 @@ def cmd_launch(args):
     log_dir = os.path.abspath(args.log_dir or os.path.join(cwd, "logs"))
 
     # ---- purpose registry gate ---------------------------------------------
-    record_file = os.path.abspath(args.record_file)
+    record_file = resolve_record_file(args.record_file, log_dir)
     known = known_purposes(record_file, args.workspace_label)
     if purpose not in known and not args.new_purpose:
         listing = ", ".join(sorted(known)) or "(none registered yet)"
@@ -367,7 +366,7 @@ def cmd_launch(args):
         "pane_label": label, "cwd": cwd, "log": log_path, "command": command,
         "create_workspace": False, "create_tab": False,
         "split": None,  # (pane_id, direction) when splitting
-        "reuse_root": None,  # fresh root pane of a workspace/tab we created
+        "fresh_root": None,  # root pane of a workspace/tab we just created
         "workspace_id": None, "tab_id": None, "tab_label": None,
     }
 
@@ -424,7 +423,7 @@ def cmd_launch(args):
         plan["workspace_id"] = ws_id
         herdr("tab", "rename", tab["tab_id"], plan["tab_label"])
         plan["tab_id"] = tab["tab_id"]
-        plan["reuse_root"] = root_pane["pane_id"]
+        plan["fresh_root"] = root_pane["pane_id"]
     elif plan["create_tab"]:
         result = herdr("tab", "create", "--workspace", plan["workspace_id"],
                        "--label", plan["tab_label"], "--cwd", cwd, focus_flag)
@@ -434,7 +433,7 @@ def cmd_launch(args):
         if not tab_id or not root_pane_id:
             die(f"unexpected tab create response: {result}")
         plan["tab_id"] = tab_id
-        plan["reuse_root"] = root_pane_id
+        plan["fresh_root"] = root_pane_id
     elif plan["split"]:
         split_id, direction = plan["split"]
         result = herdr("pane", "split", split_id, "--direction", direction,
@@ -444,7 +443,7 @@ def cmd_launch(args):
             die(f"unexpected pane split response: {result}")
         plan["pane_id"] = pane_id
     if plan.get("pane_id") is None:
-        plan["pane_id"] = plan["reuse_root"]
+        plan["pane_id"] = plan["fresh_root"]
     if not plan["pane_id"]:
         die("internal error: no target pane resolved")
 
@@ -461,25 +460,27 @@ def cmd_launch(args):
 
     # Wait for the *executed* banner so an immediate failure (pane not at a
     # prompt, typo in cd, ...) surfaces now instead of silently.  Matching
-    # "started=2" rather than the launch id is what makes this execution
-    # proof: the tty echoes the typed keystrokes back even when nothing
-    # runs, but the echo shows the unexpanded `'$(date ...)'` literal while
-    # a real execution prints the expanded timestamp (started=2026-...).
+    # the expanded timestamp rather than the launch id is what makes this
+    # execution proof: the tty echoes the typed keystrokes back even when
+    # nothing runs, but the echo shows the unexpanded `'$(date ...)'` literal
+    # while a real execution prints the expanded timestamp (started=2026-...).
     # The wait also covers a freshly created pane whose shell is still
     # booting - the line only executes once the shell is ready.
     banner_probe = subprocess.run(
         [HERDR_BIN, "pane", "wait-output", plan["pane_id"],
-         "--match", "started=2", "--timeout", "10000"],
+         "--regex", r"started=\d{4}-", "--timeout", "10000"],
         capture_output=True, text=True, encoding="utf-8", errors="replace")
     if banner_probe.returncode != 0:
-        die(f"launch banner never executed within 10s; the command was "
-            f"not recorded as started. Inspect it: herdr pane read "
-            f"{plan['pane_id']} --source recent-unwrapped")
+        die(f"launch banner never executed within 10s; the pane was created "
+            f"but the launch was NOT registered. Inspect it: herdr pane "
+            f"read {plan['pane_id']} --source recent-unwrapped")
 
-    # ---- Phase 4: global launch registry -----------------------------------
+    # ---- Phase 4: launch registry ------------------------------------------
+    # The process is already running in the pane at this point, so a registry
+    # failure must not crash the script - degrade to a warning and still
+    # print the JSON (the launch simply shows up as an untracked pane).
     record_path = None
     if not args.no_record:
-        os.makedirs(os.path.dirname(record_file), exist_ok=True)
         entry = {
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
             "purpose": purpose,
@@ -496,9 +497,15 @@ def cmd_launch(args):
             "launch_id": launch_id,
             "caller_pane": os.environ.get("HERDR_PANE_ID"),
         }
-        with open(record_file, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        record_path = record_file
+        try:
+            os.makedirs(os.path.dirname(record_file), exist_ok=True)
+            with open(record_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            record_path = record_file
+        except OSError as exc:
+            warn(f"could not append to the launch registry ({exc}); the "
+                 f"process is running in pane {plan['pane_id']} but this "
+                 f"launch is unregistered")
 
     print(json.dumps({
         "purpose": purpose,
@@ -523,20 +530,23 @@ def cmd_launch(args):
 # --------------------------------------------------------------------------
 
 def cmd_list(args):
-    record_file = os.path.abspath(args.record_file)
+    log_dir = os.path.abspath(
+        args.log_dir or os.path.join(os.getcwd(), "logs"))
+    record_file = resolve_record_file(args.record_file, log_dir)
     entries = read_registry(record_file)
-    ws = find_workspace(args.workspace_label)
+    args.lines = max(0, args.lines)
 
+    if args.purposes:
+        cmd_list_purposes(args, entries, record_file)
+        return
+
+    ws = find_workspace(args.workspace_label)
     live_panes = {}
     if ws:
         for pane in panes_of_workspace(ws["workspace_id"]):
             pid = pane.get("pane_id")
             if pid:
                 live_panes[pid] = pane
-
-    if args.purposes:
-        cmd_list_purposes(args, entries, record_file)
-        return
 
     def pane_state(pane_id):
         """live | gone for a registry pane id - purely structural (does the
@@ -564,12 +574,10 @@ def cmd_list(args):
     untracked = []
     for pid, pane in live_panes.items():
         if pid not in tracked_panes:
-            info = herdr_try("pane", "get", "--pane", pid)
             untracked.append({
                 "pane_id": pid,
                 "tab_id": pane.get("tab_id"),
-                "label": (info or {}).get("result", {}).get("pane", {})
-                .get("label", ""),
+                "label": pane.get("label", ""),
                 "recent": pane_recent(pid, args.lines),
             })
 
@@ -608,34 +616,37 @@ def cmd_list(args):
         print(f"no background processes "
               f"({'registry empty' if not entries else 'none alive'}; "
               f"registry: {record_file})")
-        return
+    else:
+        headers = ["STATE", "PURPOSE", "NOTE", "PORTS", "PANE", "TAB", "LOG"]
+        table = [[r["state"], r["purpose"], r["note"], r["ports"], r["pane"],
+                  r["tab"], r["log"]] for r in out_rows]
+        widths = [max(len(h), *(len(row[i]) for row in table))
+                  for i, h in enumerate(headers)]
+        for row in ([headers] + table):
+            print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
 
-    headers = ["STATE", "PURPOSE", "NOTE", "PORTS", "PANE", "TAB", "LOG"]
-    table = [[r["state"], r["purpose"], r["note"], r["ports"], r["pane"],
-              r["tab"], r["log"]] for r in out_rows]
-    widths = [max(len(h), *(len(row[i]) for row in table))
-              for i, h in enumerate(headers)]
-    for row in ([headers] + table):
-        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
-
-    if args.lines:
-        print()
-        for r in out_rows:
-            ports = f":{r['ports']}" if r["ports"] != "-" else ""
-            print(f"── {r['pane']} · {r['note']}{ports} "
-                  f"({r['tab']}, {r['state']})")
-            for ln in r["recent"]:
-                print(f"   {ln}")
-            if not r["recent"]:
-                print("   (no recent output)")
+        if args.lines:
+            print()
+            for r in out_rows:
+                ports = f":{r['ports']}" if r["ports"] != "-" else ""
+                print(f"── {r['pane']} · {r['note']}{ports} "
+                      f"({r['tab']}, {r['state']})")
+                for ln in r["recent"]:
+                    print(f"   {ln}")
+                if not r["recent"]:
+                    print("   (no recent output)")
 
     if untracked:
         print("\nuntracked panes in workspace (not launched via herdr-run):")
-        for u in untracked:
-            print(f"── {u['pane_id']}"
-                  + (f" ({u['label']})" if u["label"] else "") + " (untracked)")
-            for ln in u["recent"]:
-                print(f"   {ln}")
+        if args.lines:
+            for u in untracked:
+                print(f"── {u['pane_id']}"
+                      + (f" ({u['label']})" if u["label"] else "") + " (untracked)")
+                for ln in u["recent"]:
+                    print(f"   {ln}")
+        else:
+            print(", ".join(u["pane_id"] + (f" ({u['label']})" if u["label"] else "")
+                            for u in untracked))
     print(f"\nstate: live=pane 仍在 | superseded=同 pane 旧记录(遗留) | "
           f"gone=pane 已关闭 · 屏幕段=最近 {args.lines} 行非空输出"
           f"（--lines N 调整，0 关闭）——段里出现 shell 提示符即空闲，"
@@ -725,13 +736,14 @@ def main():
                           default=DEFAULT_WORKSPACE_LABEL,
                           help="herdr workspace to place processes in "
                                "(default: background)")
-    p_launch.add_argument("--record-file", default=DEFAULT_RECORD_FILE,
-                          help="global launch registry, JSONL (default: "
-                               "<skill>/data/launches.jsonl or "
+    p_launch.add_argument("--record-file", default=None,
+                          help="launch registry, JSONL (default: "
+                               "<log-dir>/launches.jsonl or "
                                "$HERDR_RUN_RECORD_FILE)")
     p_launch.add_argument("--no-record", action="store_true",
-                          help="do not append to the global launch registry "
-                               "(also removes the purpose from the registry)")
+                          help="do not append to the launch registry (the "
+                               "purpose then only stays known via its "
+                               "live tabs)")
     p_launch.add_argument("--focus", action="store_true",
                           help="focus the new tab (default: keep the user's "
                                "focus unchanged)")
@@ -754,14 +766,24 @@ def main():
     p_list.add_argument("--lines", type=int, default=8,
                         help="lines of recent screen output shown per "
                              "process, 0 to hide the segments (default: 8)")
+    p_list.add_argument("--log-dir", default=None,
+                        help="log root the registry lives under (default: "
+                             "./logs; pass the same --log-dir you launched "
+                             "with, or the logs/ dir under that --cwd)")
     p_list.add_argument("--workspace-label", default=DEFAULT_WORKSPACE_LABEL,
                         help="herdr workspace to inspect (default: background)")
-    p_list.add_argument("--record-file", default=DEFAULT_RECORD_FILE,
-                        help="launch registry (default: "
-                             "<skill>/data/launches.jsonl or "
-                             "$HERDR_RUN_RECORD_FILE)")
+    p_list.add_argument("--record-file", default=None,
+                        help="launch registry (default: ./logs/launches.jsonl "
+                             "or $HERDR_RUN_RECORD_FILE)")
     p_list.set_defaults(func=cmd_list)
 
+    # Pane output can contain characters outside the console code page
+    # (Windows redirects especially); never die mid-list for encoding.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = parser.parse_args()
     args.func(args)
 

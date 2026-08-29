@@ -1,6 +1,3 @@
-# runtime launch registry (default location: <skill>/data/)
-data/
-
 # macOS
 .DS_Store
 __pycache__/
