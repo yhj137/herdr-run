@@ -1,5 +1,7 @@
 # herdr-run
 
+**中文** | [English](README_EN.md)
+
 一个给 AI coding agent（Claude Code 等）用的 [Herdr](https://herdr.dev) 技能：agent 需要跑长时进程（服务端、LLM 代理、训练、测评……）时，不再 `nohup` 到你看不见的地方，而是把它放进 Herdr 里一个专门的 `background` 工作区——**进程就在终端 pane 里以前台方式跑着**，你随时切过去看输出、Ctrl-C 停掉，日志同时完整落盘。
 
 ![background 工作区：按用途分 tab，每个 pane 一个前台进程](imgs/0.png)
