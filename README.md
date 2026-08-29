@@ -114,4 +114,4 @@ agent 启动时给的简短备注（`--note`），同时也是 pane 标题。比
 默认 `~/.claude/skills/herdr-run/data/launches.jsonl`（项目级安装则随项目，在 `<项目>/.claude/skills/herdr-run/data/`）。想换位置：环境变量 `HERDR_RUN_RECORD_FILE` 或启动时加 `--record-file`；某次不想记录就 `--no-record`。
 
 **支持 Windows 吗？**
-支持。Windows 上 pane 是 PowerShell，脚本会自动生成 `Tee-Object` 管道与 PS 转义；走 WSL 也完全可用。
+支持。Windows 上 pane 是 PowerShell，脚本会用明确的 UTF-8 writer 同时输出到 pane 和日志，并用运行标记避免嵌套 PowerShell 被误判为空闲。包含多行或嵌套引号的命令建议写入 `.ps1`，再用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1` 启动；走 WSL 也完全可用。

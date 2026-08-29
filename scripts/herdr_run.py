@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
+from uuid import uuid4
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_WORKSPACE_LABEL = os.environ.get("HERDR_RUN_WORKSPACE", "background")
@@ -61,9 +62,20 @@ def warn(msg):
     print(f"herdr-run: warning: {msg}", file=sys.stderr)
 
 
+def run_herdr_process(args):
+    """Run Herdr with deterministic text decoding on every platform.
+
+    Herdr emits UTF-8 JSON.  Relying on the Windows system code page (often
+    GBK) can crash before we get a chance to report the actual CLI error.
+    """
+    return subprocess.run(
+        [HERDR_BIN, *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace")
+
+
 def herdr(*args):
     """Run a herdr CLI command and return its parsed JSON result."""
-    proc = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True)
+    proc = run_herdr_process(args)
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip()
         die(f"`herdr {' '.join(args)}` failed (exit {proc.returncode}): {detail}")
@@ -79,7 +91,7 @@ def herdr(*args):
 def herdr_try(*args):
     """Like herdr(), but returns None instead of exiting on failure
     (e.g. querying a pane that has since closed)."""
-    proc = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True)
+    proc = run_herdr_process(args)
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     try:
@@ -124,26 +136,46 @@ def ps_quote(text):
     return "'" + text.replace("'", "''") + "'"
 
 
-def build_shell_command(cwd, banner, command, log_path):
+def build_shell_command(cwd, banner_prefix, command, log_path, marker_path):
     """One shell line that cds, prints the banner and runs the command with
     all output tee'd to the log - in the pane shell's own dialect.
 
     POSIX panes (macOS/Linux) get a brace group piped through tee; Windows
-    panes run PowerShell, which has no brace groups or `tee -a`, so it gets
-    Tee-Object with an $? guard (compatible back to Windows PowerShell 5.1).
+    panes run PowerShell.  Windows PowerShell 5.1's Tee-Object creates UTF-16
+    files, so use a UTF-8 StreamWriter while still echoing every line live.
+    A marker exists for exactly the lifetime of the foreground command; this
+    compensates for Herdr process-info sometimes seeing only the outer shell.
     """
     if ON_WINDOWS:
         return (
             f"Set-Location {ps_quote(cwd)}; if ($?) {{ "
-            f"Write-Output {ps_quote(banner)} | "
-            f"Tee-Object -FilePath {ps_quote(log_path)} -Append; "
-            f"{command} 2>&1 | "
-            f"Tee-Object -FilePath {ps_quote(log_path)} -Append }}"
+            f"$herdrUtf8 = New-Object System.Text.UTF8Encoding($false); "
+            f"[System.IO.File]::WriteAllText({ps_quote(marker_path)}, "
+            f"$PID.ToString(), $herdrUtf8); "
+            f"$herdrWriter = New-Object System.IO.StreamWriter("
+            f"{ps_quote(log_path)}, $true, $herdrUtf8); "
+            f"try {{ "
+            f"$herdrBanner = {ps_quote(banner_prefix)} + "
+            f"(Get-Date).ToString('o'); "
+            f"Write-Output $herdrBanner; "
+            f"$herdrWriter.WriteLine($herdrBanner); $herdrWriter.Flush(); "
+            f"& {{ {command} }} 2>&1 | ForEach-Object {{ "
+            f"Write-Output $_; $herdrWriter.WriteLine($_.ToString()); "
+            f"$herdrWriter.Flush() }} "
+            f"}} finally {{ $herdrWriter.Dispose(); "
+            f"Remove-Item -LiteralPath {ps_quote(marker_path)} -Force "
+            f"-ErrorAction SilentlyContinue }} }}"
         )
     return (
         f"cd {shlex.quote(cwd)} && "
-        f"{{ echo {shlex.quote(banner)}; {command}; }} 2>&1 | "
-        f"tee -a {shlex.quote(log_path)}"
+        f"herdr_marker={shlex.quote(marker_path)}; "
+        f"printf '%s' $$ > \"$herdr_marker\" && "
+        f"trap 'rm -f -- \"$herdr_marker\"' EXIT INT TERM; "
+        # `%Y-%m-%dT%H:%M:%S%z` is supported by both GNU date (Linux) and
+        # BSD date (macOS); GNU-only `date -Iseconds` breaks on macOS.
+        f"{{ echo {shlex.quote(banner_prefix)}"
+        f"$(date '+%Y-%m-%dT%H:%M:%S%z'); "
+        f"{command}; }} 2>&1 | tee -a {shlex.quote(log_path)}"
     )
 
 
@@ -221,12 +253,27 @@ def pane_layout_rects(any_pane_id):
             if "rect" in p}
 
 
-def pane_is_idle(pane_id):
+def latest_entry_for_pane(entries, pane_id):
+    """Newest launch registry entry for a pane, if one exists."""
+    return next((e for e in reversed(entries) if e.get("pane") == pane_id),
+                None)
+
+
+def pane_has_running_marker(pane_id, entries):
+    """True when our newest launch in this pane still owns the pane."""
+    entry = latest_entry_for_pane(entries, pane_id)
+    marker = (entry or {}).get("running_marker")
+    return bool(marker and os.path.isfile(marker))
+
+
+def pane_is_idle(pane_id, entries=None):
     """True when only the shell itself is in the foreground.
 
     An idle pane reports the shell (argv like "-zsh", pid == shell_pid) as
     its foreground process; a busy pane reports the actual command.
     """
+    if entries is not None and pane_has_running_marker(pane_id, entries):
+        return False
     info = herdr_try("pane", "process-info", "--pane", pane_id)
     if info is None:
         return False
@@ -292,6 +339,7 @@ def cmd_launch(args):
 
     # ---- purpose registry gate ---------------------------------------------
     record_file = os.path.abspath(args.record_file)
+    registry_entries = read_registry(record_file)
     known = known_purposes(record_file, args.workspace_label)
     if purpose not in known and not args.new_purpose:
         listing = ", ".join(sorted(known)) or "(none registered yet)"
@@ -315,6 +363,7 @@ def cmd_launch(args):
         log_name = f"{base}-{n}.log"
         n += 1
     log_path = os.path.join(log_dir, purpose, log_name)
+    marker_path = log_path + ".running"
     label = pane_label(note, args.port)
     focus_flag = "--focus" if args.focus else "--no-focus"
 
@@ -322,6 +371,7 @@ def cmd_launch(args):
     plan = {
         "purpose": purpose, "note": note, "ports": args.port,
         "pane_label": label, "cwd": cwd, "log": log_path, "command": command,
+        "running_marker": marker_path,
         "create_workspace": False, "create_tab": False,
         "split": None,  # (pane_id, direction) when splitting
         "reuse_root": None,  # pane_id when reusing a tab's root pane
@@ -350,7 +400,8 @@ def cmd_launch(args):
             if not panes:
                 die(f"tab {plan['tab_label']} ({target['tab_id']}) has no "
                     "panes; it may be mid-close, retry")
-            if len(panes) == 1 and pane_is_idle(panes[0]["pane_id"]):
+            if (len(panes) == 1 and
+                    pane_is_idle(panes[0]["pane_id"], registry_entries)):
                 # First process in this tab: the idle root pane becomes the
                 # top-left slot of the future 2x2 grid.
                 plan["reuse_root"] = panes[0]["pane_id"]
@@ -405,10 +456,11 @@ def cmd_launch(args):
         die("internal error: no target pane resolved")
 
     # ---- Phase 3: name the pane and start the process ----------------------
-    banner = (f"[herdr-run] purpose={purpose} pane={label} "
-              f"log={log_path} started="
-              f"{datetime.now().astimezone().isoformat(timespec='seconds')}")
-    shell_command = build_shell_command(cwd, banner, command, log_path)
+    launch_id = uuid4().hex
+    banner_prefix = (f"[herdr-run] launch={launch_id} purpose={purpose} "
+                     f"pane={label} log={log_path} started=")
+    shell_command = build_shell_command(
+        cwd, banner_prefix, command, log_path, marker_path)
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     herdr("pane", "rename", plan["pane_id"], label)
@@ -418,12 +470,12 @@ def cmd_launch(args):
     # prompt, typo in cd, ...) surfaces now instead of silently.
     banner_probe = subprocess.run(
         [HERDR_BIN, "pane", "wait-output", plan["pane_id"],
-         "--match", "[herdr-run]", "--timeout", "8000"],
-        capture_output=True, text=True)
+         "--match", launch_id, "--timeout", "8000"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if banner_probe.returncode != 0:
-        warn(f"banner not observed within 8s; the pane may not have been "
-             f"at an idle prompt. Inspect it: herdr pane read "
-             f"{plan['pane_id']} --source recent-unwrapped")
+        die(f"unique launch banner not observed within 8s; the command was "
+            f"not recorded as started. Inspect it: herdr pane read "
+            f"{plan['pane_id']} --source recent-unwrapped")
 
     # ---- Phase 4: global launch registry -----------------------------------
     record_path = None
@@ -442,6 +494,8 @@ def cmd_launch(args):
             "workspace_label": args.workspace_label,
             "cwd": cwd,
             "log": log_path,
+            "running_marker": marker_path,
+            "launch_id": launch_id,
             "caller_pane": os.environ.get("HERDR_PANE_ID"),
         }
         with open(record_file, "a", encoding="utf-8") as fh:
@@ -490,7 +544,7 @@ def cmd_list(args):
         """running | idle | gone for a registry pane id."""
         if pane_id not in live_panes:
             return "gone"
-        return "idle" if pane_is_idle(pane_id) else "running"
+        return "idle" if pane_is_idle(pane_id, entries) else "running"
 
     # Group registry entries by pane: the newest entry per pane owns its
     # live state; older entries on the same pane were superseded (pane
@@ -518,7 +572,7 @@ def cmd_list(args):
                 "tab_id": pane.get("tab_id"),
                 "label": (info or {}).get("result", {}).get("pane", {})
                 .get("label", ""),
-                "idle": pane_is_idle(pid),
+                "idle": pane_is_idle(pid, entries),
             })
 
     def fmt_row(idx, e, state):

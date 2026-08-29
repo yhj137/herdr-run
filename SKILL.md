@@ -1,6 +1,6 @@
 ---
 name: herdr-run
-description: Launch long-running background processes (web servers, LLM proxies, training jobs, eval runs, daemons, watchers) as live, user-controllable foreground processes inside a dedicated Herdr "background" workspace. Creates the workspace and {purpose}_N tabs automatically, places each process in a pane (max 4 per tab in a 2x2 grid, then a new tab), names panes with their listening ports, tees all output to logs/<purpose>/, and records every launch in a global registry. Use whenever the user asks to start, run, launch, or deploy any server, service, training, or eval process that should keep running where they can watch and control it (启动服务, 后台跑训练, 部署代理). Not for one-shot commands — use plain Bash for those.
+description: Launch long-running background processes (web servers, LLM proxies, training jobs, eval runs, daemons, watchers) as live, user-controllable foreground processes inside a dedicated Herdr "background" workspace. Creates the workspace and {purpose}_N tabs automatically, places each process in a pane (max 4 per tab in a 2x2 grid, then a new tab), names panes with their listening ports, tees all output to logs/{purpose}/, and records every launch in a global registry. Use whenever the user asks to start, run, launch, or deploy any server, service, training, or eval process that should keep running where they can watch and control it (启动服务, 后台跑训练, 部署代理). Not for one-shot commands — use plain Bash for those.
 ---
 
 # herdr-run
@@ -111,8 +111,9 @@ Each row joins a registry entry with live herdr state: `running` (foreground pro
 ## Edge cases
 
 - **Very long or heavily-quoted commands** (heredocs, multi-line): write them to a script file (e.g. `run_server.sh`) and launch `bash run_server.sh` instead — `pane run` types the command into a real shell.
+- **PowerShell quoting on Windows**: put multi-line commands or commands with nested quotes in a `.ps1` file and launch `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\job.ps1`. Logs are written as UTF-8 on every platform.
 - **Launching several processes of the same purpose**: do it sequentially, one script call at a time — placement is decided from live tab/pane state, so parallel same-purpose launches can race and land in the wrong tab. Different purposes never collide and may run in parallel.
 - **Interactive prompts** (confirmation, login) will block the pane; read the pane and answer via `herdr pane send-text <pane_id> "<answer>"` or pick non-interactive flags upfront.
 - **Processes that daemonize themselves** (`&`, `nohup`, daemon mode) defeat the design — the pane would go idle while the real process hides. Strip backgrounding and let the pane be the process's lifetime.
 - The script refuses nothing silently: any herdr error is reported with the failing command. `--dry-run` is cheap — use it when unsure about placement.
-- **Platforms**: macOS, Linux, and Windows all work. The tee pipeline is generated per platform — POSIX shells get `… 2>&1 | tee -a`, Windows PowerShell panes get `Tee-Object -Append` with PS quoting automatically; you never need to care which.
+- **Platforms**: macOS, Linux, and Windows all work. The logging pipeline is generated per platform. Windows PowerShell uses an explicit UTF-8 writer and a per-launch running marker so nested PowerShell commands are not mistaken for an idle pane.
