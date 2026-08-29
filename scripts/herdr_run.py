@@ -109,7 +109,7 @@ def sanitize_purpose(raw):
 
 def pane_label(note, ports):
     # Any process that listens on a port must carry that port in its pane
-    # name, e.g. "llm proxy:7890", so port conflicts are visible at a glance.
+    # name, e.g. "llm proxy:28117", so port conflicts are visible at a glance.
     if ports:
         return f"{note}:{','.join(str(p) for p in ports)}"
     return note
@@ -136,22 +136,18 @@ def ps_quote(text):
     return "'" + text.replace("'", "''") + "'"
 
 
-def build_shell_command(cwd, banner_prefix, command, log_path, marker_path):
+def build_shell_command(cwd, banner_prefix, command, log_path):
     """One shell line that cds, prints the banner and runs the command with
     all output tee'd to the log - in the pane shell's own dialect.
 
     POSIX panes (macOS/Linux) get a brace group piped through tee; Windows
     panes run PowerShell.  Windows PowerShell 5.1's Tee-Object creates UTF-16
     files, so use a UTF-8 StreamWriter while still echoing every line live.
-    A marker exists for exactly the lifetime of the foreground command; this
-    compensates for Herdr process-info sometimes seeing only the outer shell.
     """
     if ON_WINDOWS:
         return (
             f"Set-Location {ps_quote(cwd)}; if ($?) {{ "
             f"$herdrUtf8 = New-Object System.Text.UTF8Encoding($false); "
-            f"[System.IO.File]::WriteAllText({ps_quote(marker_path)}, "
-            f"$PID.ToString(), $herdrUtf8); "
             f"$herdrWriter = New-Object System.IO.StreamWriter("
             f"{ps_quote(log_path)}, $true, $herdrUtf8); "
             f"try {{ "
@@ -162,15 +158,10 @@ def build_shell_command(cwd, banner_prefix, command, log_path, marker_path):
             f"& {{ {command} }} 2>&1 | ForEach-Object {{ "
             f"Write-Output $_; $herdrWriter.WriteLine($_.ToString()); "
             f"$herdrWriter.Flush() }} "
-            f"}} finally {{ $herdrWriter.Dispose(); "
-            f"Remove-Item -LiteralPath {ps_quote(marker_path)} -Force "
-            f"-ErrorAction SilentlyContinue }} }}"
+            f"}} finally {{ $herdrWriter.Dispose() }} }}"
         )
     return (
         f"cd {shlex.quote(cwd)} && "
-        f"herdr_marker={shlex.quote(marker_path)}; "
-        f"printf '%s' $$ > \"$herdr_marker\" && "
-        f"trap 'rm -f -- \"$herdr_marker\"' EXIT INT TERM; "
         # `%Y-%m-%dT%H:%M:%S%z` is supported by both GNU date (Linux) and
         # BSD date (macOS); GNU-only `date -Iseconds` breaks on macOS.
         f"{{ echo {shlex.quote(banner_prefix)}"
@@ -253,34 +244,39 @@ def pane_layout_rects(any_pane_id):
             if "rect" in p}
 
 
-def latest_entry_for_pane(entries, pane_id):
-    """Newest launch registry entry for a pane, if one exists."""
-    return next((e for e in reversed(entries) if e.get("pane") == pane_id),
-                None)
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def pane_has_running_marker(pane_id, entries):
-    """True when our newest launch in this pane still owns the pane."""
-    entry = latest_entry_for_pane(entries, pane_id)
-    marker = (entry or {}).get("running_marker")
-    return bool(marker and os.path.isfile(marker))
+def recent_lines(text, n=8, width=120):
+    """The last n non-empty lines of a pane screen or log tail - ANSI
+    stripped and width-capped.  Empty lines are skipped so trailing blanks
+    never hide the output that matters."""
+    lines = [ANSI_RE.sub("", ln).rstrip() for ln in (text or "").splitlines()]
+    lines = [ln for ln in lines if ln.strip()]
+    return [ln[:width - 1] + "…" if len(ln) > width else ln
+            for ln in lines[-n:]]
 
 
-def pane_is_idle(pane_id, entries=None):
-    """True when only the shell itself is in the foreground.
+def pane_recent(pane_id, n=8):
+    """Recent screen segment of a live pane.  A shell prompt in it means
+    the process exited; scrolling output means it is busy.  Liveness is
+    read off the screen by the agent, not computed."""
+    proc = run_herdr_process(
+        ["pane", "read", pane_id, "--source", "recent-unwrapped"])
+    if proc.returncode != 0:
+        return []
+    return recent_lines(proc.stdout, n)
 
-    An idle pane reports the shell (argv like "-zsh", pid == shell_pid) as
-    its foreground process; a busy pane reports the actual command.
-    """
-    if entries is not None and pane_has_running_marker(pane_id, entries):
-        return False
-    info = herdr_try("pane", "process-info", "--pane", pane_id)
-    if info is None:
-        return False
-    proc_info = info.get("result", {}).get("process_info", {})
-    procs = proc_info.get("foreground_processes", [])
-    shell_pid = proc_info.get("shell_pid")
-    return all(p.get("pid") == shell_pid for p in procs)
+
+def log_recent(log_path, n=8):
+    """Tail segment of the on-disk log, for rows whose pane is gone."""
+    try:
+        with open(log_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 16384))
+            return recent_lines(fh.read().decode("utf-8", "replace"), n)
+    except OSError:
+        return []
 
 
 def choose_split(rects):
@@ -339,7 +335,6 @@ def cmd_launch(args):
 
     # ---- purpose registry gate ---------------------------------------------
     record_file = os.path.abspath(args.record_file)
-    registry_entries = read_registry(record_file)
     known = known_purposes(record_file, args.workspace_label)
     if purpose not in known and not args.new_purpose:
         listing = ", ".join(sorted(known)) or "(none registered yet)"
@@ -363,7 +358,6 @@ def cmd_launch(args):
         log_name = f"{base}-{n}.log"
         n += 1
     log_path = os.path.join(log_dir, purpose, log_name)
-    marker_path = log_path + ".running"
     label = pane_label(note, args.port)
     focus_flag = "--focus" if args.focus else "--no-focus"
 
@@ -371,10 +365,9 @@ def cmd_launch(args):
     plan = {
         "purpose": purpose, "note": note, "ports": args.port,
         "pane_label": label, "cwd": cwd, "log": log_path, "command": command,
-        "running_marker": marker_path,
         "create_workspace": False, "create_tab": False,
         "split": None,  # (pane_id, direction) when splitting
-        "reuse_root": None,  # pane_id when reusing a tab's root pane
+        "reuse_root": None,  # fresh root pane of a workspace/tab we created
         "workspace_id": None, "tab_id": None, "tab_label": None,
     }
 
@@ -400,17 +393,17 @@ def cmd_launch(args):
             if not panes:
                 die(f"tab {plan['tab_label']} ({target['tab_id']}) has no "
                     "panes; it may be mid-close, retry")
-            if (len(panes) == 1 and
-                    pane_is_idle(panes[0]["pane_id"], registry_entries)):
-                # First process in this tab: the idle root pane becomes the
-                # top-left slot of the future 2x2 grid.
-                plan["reuse_root"] = panes[0]["pane_id"]
-            else:
-                rects = pane_layout_rects(panes[0]["pane_id"])
-                split_id, direction = choose_split(rects)
-                if split_id is None:
-                    die(f"no pane geometry available for tab {plan['tab_label']}")
-                plan["split"] = [split_id, direction]
+            # Every launch gets a fresh pane.  An existing pane belongs to
+            # its launch for as long as the pane exists, even after the
+            # process exited - closing the pane is how its slot is freed.
+            # This also keeps placement purely structural (tab pane counts),
+            # never dependent on eventually-consistent process state, so
+            # back-to-back launches cannot race on "is this pane idle?".
+            rects = pane_layout_rects(panes[0]["pane_id"])
+            split_id, direction = choose_split(rects)
+            if split_id is None:
+                die(f"no pane geometry available for tab {plan['tab_label']}")
+            plan["split"] = [split_id, direction]
 
     # ---- Phase 2: execute the plan ----------------------------------------
     if args.dry_run:
@@ -460,20 +453,26 @@ def cmd_launch(args):
     banner_prefix = (f"[herdr-run] launch={launch_id} purpose={purpose} "
                      f"pane={label} log={log_path} started=")
     shell_command = build_shell_command(
-        cwd, banner_prefix, command, log_path, marker_path)
+        cwd, banner_prefix, command, log_path)
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     herdr("pane", "rename", plan["pane_id"], label)
     herdr("pane", "run", plan["pane_id"], shell_command)
 
-    # Wait briefly for the banner so an immediate failure (pane not at a
-    # prompt, typo in cd, ...) surfaces now instead of silently.
+    # Wait for the *executed* banner so an immediate failure (pane not at a
+    # prompt, typo in cd, ...) surfaces now instead of silently.  Matching
+    # "started=2" rather than the launch id is what makes this execution
+    # proof: the tty echoes the typed keystrokes back even when nothing
+    # runs, but the echo shows the unexpanded `'$(date ...)'` literal while
+    # a real execution prints the expanded timestamp (started=2026-...).
+    # The wait also covers a freshly created pane whose shell is still
+    # booting - the line only executes once the shell is ready.
     banner_probe = subprocess.run(
         [HERDR_BIN, "pane", "wait-output", plan["pane_id"],
-         "--match", launch_id, "--timeout", "8000"],
+         "--match", "started=2", "--timeout", "10000"],
         capture_output=True, text=True, encoding="utf-8", errors="replace")
     if banner_probe.returncode != 0:
-        die(f"unique launch banner not observed within 8s; the command was "
+        die(f"launch banner never executed within 10s; the command was "
             f"not recorded as started. Inspect it: herdr pane read "
             f"{plan['pane_id']} --source recent-unwrapped")
 
@@ -494,7 +493,6 @@ def cmd_launch(args):
             "workspace_label": args.workspace_label,
             "cwd": cwd,
             "log": log_path,
-            "running_marker": marker_path,
             "launch_id": launch_id,
             "caller_pane": os.environ.get("HERDR_PANE_ID"),
         }
@@ -541,14 +539,14 @@ def cmd_list(args):
         return
 
     def pane_state(pane_id):
-        """running | idle | gone for a registry pane id."""
-        if pane_id not in live_panes:
-            return "gone"
-        return "idle" if pane_is_idle(pane_id, entries) else "running"
+        """live | gone for a registry pane id - purely structural (does the
+        pane exist).  Whether the process is actually running is read off
+        the RECENT column, not computed."""
+        return "live" if pane_id in live_panes else "gone"
 
     # Group registry entries by pane: the newest entry per pane owns its
-    # live state; older entries on the same pane were superseded (pane
-    # reused after the earlier process exited).
+    # live state; older entries on the same pane were superseded (legacy
+    # data - launches no longer reuse panes).
     by_pane = {}
     for idx, entry in enumerate(entries):
         by_pane.setdefault(entry.get("pane"), []).append((idx, entry))
@@ -572,11 +570,14 @@ def cmd_list(args):
                 "tab_id": pane.get("tab_id"),
                 "label": (info or {}).get("result", {}).get("pane", {})
                 .get("label", ""),
-                "idle": pane_is_idle(pid, entries),
+                "recent": pane_recent(pid, args.lines),
             })
 
     def fmt_row(idx, e, state):
         ports = ",".join(str(p) for p in e.get("ports") or []) or "-"
+        recent = (pane_recent(e.get("pane"), args.lines)
+                  if state == "live" else log_recent(e.get("log") or "",
+                                                     args.lines))
         return {
             "time": e.get("time", "?"),
             "purpose": e.get("purpose", "?"),
@@ -585,11 +586,12 @@ def cmd_list(args):
             "pane": e.get("pane") or "-",
             "tab": e.get("tab_label") or "-",
             "state": state,
+            "recent": recent,
             "log": e.get("log", "-"),
             "command": e.get("command", "-"),
         }
 
-    live_states = {"running", "idle"}
+    live_states = {"live"}
     shown = [r for r in rows if args.history or r[2] in live_states]
     out_rows = [fmt_row(*r) for r in shown]
 
@@ -615,12 +617,29 @@ def cmd_list(args):
               for i, h in enumerate(headers)]
     for row in ([headers] + table):
         print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+    if args.lines:
+        print()
+        for r in out_rows:
+            ports = f":{r['ports']}" if r["ports"] != "-" else ""
+            print(f"── {r['pane']} · {r['note']}{ports} "
+                  f"({r['tab']}, {r['state']})")
+            for ln in r["recent"]:
+                print(f"   {ln}")
+            if not r["recent"]:
+                print("   (no recent output)")
+
     if untracked:
-        ids = ", ".join(u["pane_id"] + (f" ({u['label']})" if u["label"] else "")
-                        for u in untracked)
-        print(f"\nuntracked panes in workspace (not launched via herdr-run): {ids}")
-    print(f"\nstates: running=进程在前台运行 | idle=pane 空闲(进程已退出) | "
-          f"superseded=pane 已被复用 | gone=pane 已关闭")
+        print("\nuntracked panes in workspace (not launched via herdr-run):")
+        for u in untracked:
+            print(f"── {u['pane_id']}"
+                  + (f" ({u['label']})" if u["label"] else "") + " (untracked)")
+            for ln in u["recent"]:
+                print(f"   {ln}")
+    print(f"\nstate: live=pane 仍在 | superseded=同 pane 旧记录(遗留) | "
+          f"gone=pane 已关闭 · 屏幕段=最近 {args.lines} 行非空输出"
+          f"（--lines N 调整，0 关闭）——段里出现 shell 提示符即空闲，"
+          f"持续滚动即在跑")
 
 
 def cmd_list_purposes(args, entries, record_file):
@@ -732,6 +751,9 @@ def main():
                              "live ones")
     p_list.add_argument("--json", action="store_true",
                         help="machine-readable output")
+    p_list.add_argument("--lines", type=int, default=8,
+                        help="lines of recent screen output shown per "
+                             "process, 0 to hide the segments (default: 8)")
     p_list.add_argument("--workspace-label", default=DEFAULT_WORKSPACE_LABEL,
                         help="herdr workspace to inspect (default: background)")
     p_list.add_argument("--record-file", default=DEFAULT_RECORD_FILE,

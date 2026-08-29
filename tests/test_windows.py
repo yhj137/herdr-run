@@ -15,7 +15,7 @@ SPEC.loader.exec_module(herdr_run)
 
 @unittest.skipUnless(os.name == "nt", "Windows-specific behavior")
 class WindowsShellCommandTests(unittest.TestCase):
-    def test_log_is_utf8_without_bom_and_marker_is_cleaned(self):
+    def test_log_is_utf8_without_bom_and_no_stray_marker_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, "output.log")
             marker = log + ".running"
@@ -23,8 +23,7 @@ class WindowsShellCommandTests(unittest.TestCase):
 
             with mock.patch.object(herdr_run, "ON_WINDOWS", True):
                 shell_command = herdr_run.build_shell_command(
-                    tmp, "[herdr-run] launch=test started=", command,
-                    log, marker)
+                    tmp, "[herdr-run] launch=test started=", command, log)
 
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-Command", shell_command],
@@ -40,17 +39,6 @@ class WindowsShellCommandTests(unittest.TestCase):
             self.assertIn("中文日志", text)
             self.assertFalse(os.path.exists(marker))
 
-    def test_running_marker_overrides_incorrect_idle_process_info(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker = os.path.join(tmp, "job.log.running")
-            Path(marker).write_text("123", encoding="ascii")
-            entries = [{"pane": "w1:p1", "running_marker": marker}]
-
-            with mock.patch.object(herdr_run, "herdr_try") as herdr_try:
-                self.assertFalse(
-                    herdr_run.pane_is_idle("w1:p1", entries))
-                herdr_try.assert_not_called()
-
     def test_herdr_cli_is_always_decoded_as_utf8(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="{}", stderr="")
@@ -65,11 +53,16 @@ class WindowsShellCommandTests(unittest.TestCase):
         with mock.patch.object(herdr_run, "ON_WINDOWS", False):
             shell_command = herdr_run.build_shell_command(
                 "/tmp/project", "[herdr-run] started=", "sleep 1",
-                "/tmp/job.log", "/tmp/job.log.running")
+                "/tmp/job.log")
 
         self.assertNotIn("date -I", shell_command)
         self.assertIn("date '+%Y-%m-%dT%H:%M:%S%z'", shell_command)
         self.assertIn("tee -a", shell_command)
+        # No liveness bookkeeping on the pane: the banner's date stays an
+        # unexpanded literal in the typed line, which is what lets the
+        # launcher's "started=2" wait match execution, not tty echo.
+        self.assertNotIn("trap ", shell_command)
+        self.assertNotIn(".running", shell_command)
 
 
 if __name__ == "__main__":
