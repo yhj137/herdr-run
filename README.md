@@ -15,7 +15,7 @@ herdr-run 把这类进程统一管起来。你要做的只是正常跟 agent 说
 
 ## 安装
 
-前置要求：[herdr](https://herdr.dev)（`herdr --version` 可用；macOS / Linux / Windows 均可，Windows 用 `irm https://herdr.dev/install.ps1 | iex` 安装，或走 WSL）和 Python 3。
+前置要求：[herdr](https://herdr.dev)（`herdr --version` 可用；macOS / Linux / Windows 均可，Windows 用 `irm https://herdr.dev/install.ps1 | iex` 安装，或走 WSL）和 Python 3。**请在Herdr中使用本skill以获得最佳体验**。
 
 ### 一键安装（推荐，40+ agent 通用）
 
